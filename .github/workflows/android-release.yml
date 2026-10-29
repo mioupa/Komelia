@@ -1,0 +1,158 @@
+name: Android release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  native-libs:
+    name: Native libraries (${{ matrix.arch }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    strategy:
+      matrix:
+        arch: [ aarch64, armv7a ]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Compute submodules hash
+        id: submodules
+        run: echo "hash=$(git submodule status --recursive | awk '{print $1, $2}' | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore native libraries cache
+        id: cache
+        uses: actions/cache@v6
+        with:
+          path: native-${{ matrix.arch }}.tar.gz
+          key: android-native-${{ matrix.arch }}-${{ steps.submodules.outputs.hash }}-${{ hashFiles('CMakeLists.txt', 'cmake/android.Dockerfile', 'cmake/android-build.sh', 'cmake/external/**', 'komelia-infra/**/native/**') }}
+
+      - name: Free disk space
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache/CodeQL /usr/share/swift
+          df -h /
+
+      - name: Build docker image
+        if: steps.cache.outputs.cache-hit != 'true'
+        # Dockerfile does not use the build context, avoid sending the whole repository with submodules to the daemon
+        run: docker build -t komelia-build-android - < cmake/android.Dockerfile
+
+      - name: Build native libraries
+        if: steps.cache.outputs.cache-hit != 'true'
+        # run as the runner user so the container can write to the checked out sources
+        run: |
+          docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$PWD:/build" komelia-build-android ${{ matrix.arch }}
+          cd cmake/build-android-${{ matrix.arch }}/sysroot
+          for lib in libvips.so libkomelia_vips.so libkomelia_android_bitmap.so libonnxruntime.so libomp.so; do
+            test -f "lib/$lib" || { echo "::error::lib/$lib was not built"; exit 1; }
+          done
+          tar -czf "$GITHUB_WORKSPACE/native-${{ matrix.arch }}.tar.gz" lib/*.so*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-${{ matrix.arch }}
+          path: native-${{ matrix.arch }}.tar.gz
+          retention-days: 7
+          compression-level: 0
+          if-no-files-found: error
+
+  apk:
+    name: Signed APK
+    needs: native-libs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Checkout Gradle submodules
+        # native library sources are not needed here, only Kotlin modules included in settings.gradle.kts
+        run: git submodule update --init --depth 1 third_party/ChipTextField third_party/compose-sonner third_party/secret-service
+
+      - name: Restore keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::KEYSTORE_BASE64 secret is not set"
+            exit 1
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+
+      - uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: 17
+          cache: gradle
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: native-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/native
+
+      - name: Extract native libraries
+        run: |
+          for arch in aarch64 armv7a; do
+            mkdir -p "cmake/build-android-$arch/sysroot"
+            tar -xzf "$RUNNER_TEMP/native/native-$arch.tar.gz" -C "cmake/build-android-$arch/sysroot"
+          done
+
+      - name: Copy JNI libraries
+        run: ./gradlew android-aarch64_copyJniLibs android-armv7a_copyJniLibs
+
+      - name: Build epub readers
+        run: ./gradlew buildEpubReaders
+
+      - name: Build release APK
+        env:
+          KOMELIA_KEYSTORE_PATH: ${{ runner.temp }}/release.keystore
+          KOMELIA_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KOMELIA_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KOMELIA_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: ./gradlew :androidRelease
+
+      - name: Verify and rename APK
+        run: |
+          apk=$(ls komelia-app/androidApp/build/outputs/apk/release/*.apk)
+          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)/apksigner"
+          "$apksigner" verify --print-certs "$apk"
+          for abi in arm64-v8a armeabi-v7a; do
+            unzip -l "$apk" "lib/$abi/libvips.so" > /dev/null || { echo "::error::$abi native libraries are missing"; exit 1; }
+          done
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            name="komelia-$GITHUB_REF_NAME.apk"
+          else
+            version=$(sed -n 's/^app-version = "\(.*\)"/\1/p' gradle/libs.versions.toml)
+            name="komelia-$version-fork-${GITHUB_SHA::7}.apk"
+          fi
+          mkdir -p dist
+          cp "$apk" "dist/$name"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: komelia-apk
+          path: dist/*.apk
+          if-no-files-found: error
+
+      - name: Attach APK to GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" > /dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
+          gh release upload "$GITHUB_REF_NAME" dist/*.apk --clobber
