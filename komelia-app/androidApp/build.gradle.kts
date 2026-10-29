@@ -1,5 +1,6 @@
 import org.jetbrains.kotlin.gradle.dsl.JvmTarget
 import org.jetbrains.kotlin.gradle.plugin.extraProperties
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.kotlinSerialization)
@@ -53,6 +54,15 @@ val androidVariant = runCatching {
     )
 }.getOrDefault(AndroidVariant.STANDALONE)
 
+// release signing config is read from gitignored keystore.properties in the root project dir or from env variables
+val keystoreProperties = Properties().apply {
+    providers.fileContents(rootProject.layout.projectDirectory.file("keystore.properties"))
+        .asText.orNull?.let { load(it.reader()) }
+}
+
+fun signingProperty(key: String, envVariable: String): String? =
+    keystoreProperties.getProperty(key) ?: providers.environmentVariable(envVariable).orNull
+
 android {
     namespace = "io.github.snd_r.komelia"
     compileSdk = libs.versions.android.compileSdk.get().toInt()
@@ -74,6 +84,7 @@ android {
         targetSdk = libs.versions.android.targetSdk.get().toInt()
         versionCode = libs.versions.android.versionCode.get().toInt()
         versionName = libs.versions.app.version.get()
+        versionNameSuffix = "-fork"
 
         val enableSelfUpdates = when (androidVariant) {
             AndroidVariant.STANDALONE -> "true"
@@ -94,10 +105,22 @@ android {
             includeInBundle = false
         }
     }
+    signingConfigs {
+        val storeFilePath = signingProperty("storeFile", "KOMELIA_KEYSTORE_PATH")
+        if (storeFilePath != null) {
+            create("release") {
+                storeFile = rootProject.file(storeFilePath)
+                storePassword = signingProperty("storePassword", "KOMELIA_KEYSTORE_PASSWORD")
+                keyAlias = signingProperty("keyAlias", "KOMELIA_KEY_ALIAS")
+                keyPassword = signingProperty("keyPassword", "KOMELIA_KEY_PASSWORD")
+            }
+        }
+    }
     buildTypes {
         release {
             isMinifyEnabled = true
             isShrinkResources = true
+            signingConfig = signingConfigs.findByName("release")
 
             // required by playstore. helps to reduce apk/bundle size
             // saves 185KB but mangles stacktraces

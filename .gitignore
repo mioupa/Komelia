@@ -16,3 +16,8 @@ build/
 /output
 /.kotlin
 /cmake/build*
+
+# release signing
+keystore.properties
+*.jks
+*.keystore
